@@ -19,6 +19,7 @@
 #    include <avr/pgmspace.h>
 #    include <avr/io.h>
 #    include <avr/interrupt.h>
+#    include <util/atomic.h>
 #endif
 #if defined(PROTOCOL_CHIBIOS)
 #    include "hal.h"
@@ -186,18 +187,105 @@ extern layer_state_t layer_state;
 #if defined(__AVR__)
 typedef uint8_t pin_t;
 
-#    define setPinInput(pin) (DDRx_ADDRESS(pin) &= ~_BV((pin)&0xF), PORTx_ADDRESS(pin) &= ~_BV((pin)&0xF))
-#    define setPinInputHigh(pin) (DDRx_ADDRESS(pin) &= ~_BV((pin)&0xF), PORTx_ADDRESS(pin) |= _BV((pin)&0xF))
-#    define setPinInputLow(pin) _Static_assert(0, "AVR processors cannot implement an input as pull low")
-#    define setPinOutput(pin) (DDRx_ADDRESS(pin) |= _BV((pin)&0xF))
+#    define GPIO_FORCE_PRECOMPUTE(var) asm volatile("" : : "g"(var));
+#    define GPIO_BARRIER() asm volatile("")
 
-#    define writePinHigh(pin) (PORTx_ADDRESS(pin) |= _BV((pin)&0xF))
-#    define writePinLow(pin) (PORTx_ADDRESS(pin) &= ~_BV((pin)&0xF))
+#    define setPinInput(pin) \
+    (__extension__({ \
+        volatile uint8_t *ddr = &DDRx_ADDRESS(pin); \
+        volatile uint8_t *port = &PORTx_ADDRESS(pin); \
+        uint8_t inv_mask = (uint8_t)~_BV((pin) & 0xF); \
+        GPIO_FORCE_PRECOMPUTE(inv_mask); \
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+            *ddr &= inv_mask; \
+            *port &= inv_mask; \
+        } \
+        GPIO_BARRIER(); \
+    }))
+
+#    define setPinInputHigh(pin) \
+    (__extension__({ \
+        volatile uint8_t *ddr = &DDRx_ADDRESS(pin); \
+        volatile uint8_t *port = &PORTx_ADDRESS(pin); \
+        uint8_t mask = _BV((pin) & 0xF); \
+        uint8_t inv_mask = (uint8_t)~mask; \
+        GPIO_FORCE_PRECOMPUTE(mask); \
+        GPIO_FORCE_PRECOMPUTE(inv_mask); \
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+            *ddr &= inv_mask; \
+            *port |= mask; \
+        } \
+        GPIO_BARRIER(); \
+    }))
+
+#    define setPinInputLow(pin) _Static_assert(0, "AVR processors cannot implement an input as pull low")
+
+#    define setPinOutput(pin) \
+    (__extension__({ \
+        if (__builtin_constant_p(pin)) { \
+            if (((pin) & 0xF) <= 7) { \
+                asm volatile("sbi %0,%1" : : "I"(_SFR_IO_ADDR(DDRx_ADDRESS(pin))), "I"((pin) & 0xF)); \
+            } \
+        } else { \
+            volatile uint8_t *ddr = &DDRx_ADDRESS(pin); \
+            uint8_t mask = _BV((pin) & 0xF); \
+            GPIO_FORCE_PRECOMPUTE(mask); \
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+                *ddr |= mask; \
+            } \
+            GPIO_BARRIER(); \
+        } \
+    }))
+
+#    define writePinHigh(pin) \
+    (__extension__ ({ \
+        if (__builtin_constant_p(pin)) { \
+            if (((pin) & 0xF) <= 7) { \
+                asm volatile("sbi %0,%1" : : "I"(_SFR_IO_ADDR(PORTx_ADDRESS(pin))), "I"((pin) & 0xF)); \
+            } \
+        } else { \
+            volatile uint8_t *port = &PORTx_ADDRESS(pin); \
+            uint8_t mask = _BV((pin) & 0xF); \
+            GPIO_FORCE_PRECOMPUTE(mask); \
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+                *port |= mask; \
+            } \
+            GPIO_BARRIER(); \
+        } \
+    }))
+
+#    define writePinLow(pin) \
+    (__extension__ ({ \
+        if (__builtin_constant_p(pin)) { \
+            if (((pin) & 0xF) <= 7) { \
+                asm volatile("cbi %0,%1" : : "I"(_SFR_IO_ADDR(PORTx_ADDRESS(pin))), "I"((pin) & 0xF)); \
+            } \
+        } else { \
+            volatile uint8_t *port = &PORTx_ADDRESS(pin); \
+            uint8_t inv_mask = (uint8_t)~_BV((pin) & 0xF); \
+            GPIO_FORCE_PRECOMPUTE(inv_mask); \
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+                *port &= inv_mask; \
+            } \
+            GPIO_BARRIER(); \
+        } \
+    }))
+
 #    define writePin(pin, level) ((level) ? writePinHigh(pin) : writePinLow(pin))
 
 #    define readPin(pin) ((bool)(PINx_ADDRESS(pin) & _BV((pin)&0xF)))
 
-#    define togglePin(pin) (PORTx_ADDRESS(pin) ^= _BV((pin)&0xF))
+#    define togglePin(pin) \
+    (__extension__({ \
+        volatile uint8_t *port = &PORTx_ADDRESS(pin); \
+        uint8_t mask = _BV((pin) & 0xF); \
+        GPIO_FORCE_PRECOMPUTE(mask); \
+        ATOMIC_BLOCK(ATOMIC_RESTORESTATE) { \
+            *port ^= mask; \
+        } \
+        GPIO_BARRIER(); \
+    }))
+
 
 #elif defined(PROTOCOL_CHIBIOS)
 typedef ioline_t pin_t;
@@ -249,11 +337,8 @@ void set_single_persistent_default_layer(uint8_t default_layer);
 
 void tap_random_base64(void);
 
-#define IS_LAYER_ON(layer) layer_state_is(layer)
-#define IS_LAYER_OFF(layer) !layer_state_is(layer)
-
-#define IS_LAYER_ON_STATE(state, layer) layer_state_cmp(state, layer)
-#define IS_LAYER_OFF_STATE(state, layer) !layer_state_cmp(state, layer)
+#define IS_LAYER_ON(layer) (layer_state & (1UL << (layer)))
+#define IS_LAYER_OFF(layer) (~layer_state & (1UL << (layer)))
 
 void     matrix_init_kb(void);
 void     matrix_scan_kb(void);
